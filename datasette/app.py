@@ -49,7 +49,7 @@ from .events import Event
 from .plugins import DEFAULT_PLUGINS, get_plugins, pm
 from .renderer import json_renderer
 from .resources import DatabaseResource, TableResource
-from .telemetry import tracer
+from .telemetry import TelemetryMiddleware, tracer
 from .telemetry_registry import STARTUP
 from .tokens import TokenInvalid
 from .tracer import AsgiTracer
@@ -777,12 +777,16 @@ class Datasette:
         # This must be called for Datasette to be in a usable state
         if self._startup_invoked:
             return
-        # invoke_startup() runs before any request exists, so every span its
-        # children create - the register_* hook dispatches, the internal
-        # catalog's db.query/db.write spans, and the prepare_connection
-        # warm-up of the read connections those touch - would otherwise be
-        # its own orphan root trace: around twenty of them on a fresh
-        # instance. Bracketing the whole thing gives them somewhere to belong.
+        # `datasette serve` calls invoke_startup() before uvicorn starts, so
+        # on the CLI path every span its children create - the register_*
+        # hook dispatches, the internal catalog's db.query/db.write spans,
+        # and the prepare_connection warm-up of the read connections those
+        # touch - would otherwise be its own orphan root trace: around twenty
+        # of them on a fresh instance. Bracketing the whole thing gives them
+        # somewhere to belong. An ASGI-hosted or programmatic deployment
+        # reaches here instead through AsgiRunOnFirstRequest, in which case
+        # this span nests under the first request's own span - honest enough,
+        # since it genuinely is that request's latency.
         # A connection warmed lazily later, by a request touching a new
         # database for the first time, nests under that request instead:
         # this span has already ended by then.
@@ -2837,6 +2841,11 @@ class Datasette:
         asgi = AsgiRunOnFirstRequest(asgi, on_startup=[setup_db, self.invoke_startup])
         for wrapper in pm.hook.asgi_wrapper(datasette=self):
             asgi = wrapper(asgi)
+        # Outermost, deliberately: plugin asgi_wrapper() middleware and the
+        # CSRF layer run *inside* this span, so a span created by an
+        # instrumented plugin parents to the request instead of becoming its
+        # own orphan root trace.
+        asgi = TelemetryMiddleware(asgi)
         return asgi
 
 
